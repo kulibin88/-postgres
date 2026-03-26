@@ -1,0 +1,2166 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+import psycopg2
+from psycopg2 import sql
+import psycopg2.extras
+import configparser
+import os
+import tkinter.font as tkfont
+import time
+
+CONFIG_FILE = "db_config.ini"
+
+# ========== ФУНКЦИИ ДЛЯ КОПИРОВАНИЯ/ВСТАВКИ (исправлены) ==========
+_last_paste_time = 0
+_paste_delay = 0.1
+
+def copy_text(widget):
+    """Копировать выделенный текст в буфер обмена"""
+    try:
+        if widget.selection_present():
+            widget.clipboard_clear()
+            widget.clipboard_append(widget.selection_get())
+    except:
+        pass
+
+def cut_text(widget):
+    """Вырезать выделенный текст в буфер обмена"""
+    try:
+        if widget.selection_present():
+            widget.clipboard_clear()
+            widget.clipboard_append(widget.selection_get())
+            widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+    except:
+        pass
+
+def paste_text(widget):
+    """Вставить текст из буфера обмена, заменяя выделение"""
+    global _last_paste_time
+    now = time.time()
+    if now - _last_paste_time < _paste_delay:
+        return  # защита от повторной вставки
+    _last_paste_time = now
+    try:
+        # Если есть выделение, удаляем его
+        if widget.selection_present():
+            widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+        # Вставляем текст
+        text = widget.clipboard_get()
+        widget.insert(tk.INSERT, text)
+    except:
+        pass
+
+def enable_copy_paste(widget):
+    """Добавляет привязки клавиш для копирования/вставки/вырезания"""
+    if not hasattr(widget, '_copy_paste_enabled'):
+        widget.bind("<Control-c>", lambda e: (copy_text(widget), "break"))
+        widget.bind("<Control-Insert>", lambda e: (copy_text(widget), "break"))
+        widget.bind("<Control-v>", lambda e: (paste_text(widget), "break"))
+        widget.bind("<Shift-Insert>", lambda e: (paste_text(widget), "break"))
+        widget.bind("<Control-x>", lambda e: (cut_text(widget), "break"))
+        widget._copy_paste_enabled = True
+
+
+# ========== КЛАСС ОКНА ПОДКЛЮЧЕНИЯ ==========
+class ConnectionWindow:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Подключение к PostgreSQL")
+        self.root.geometry("350x280")
+        self.root.resizable(False, False)
+        self.root.attributes('-topmost', True)
+        self.root.after(200, lambda: self.root.attributes('-topmost', False))
+
+        self.config = configparser.ConfigParser()
+        self.load_config()
+
+        self.host_var = tk.StringVar(value=self.config.get("DB", "host", fallback="localhost"))
+        self.port_var = tk.StringVar(value=self.config.get("DB", "port", fallback="5432"))
+        self.db_var = tk.StringVar(value=self.config.get("DB", "database", fallback=""))
+        self.user_var = tk.StringVar(value=self.config.get("DB", "user", fallback=""))
+        self.pwd_var = tk.StringVar(value=self.config.get("DB", "password", fallback=""))
+
+        ttk.Label(self.root, text="Хост:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.host_entry = ttk.Entry(self.root, textvariable=self.host_var, width=30)
+        self.host_entry.grid(row=0, column=1, padx=5, pady=5)
+        enable_copy_paste(self.host_entry)
+
+        ttk.Label(self.root, text="Порт:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.port_entry = ttk.Entry(self.root, textvariable=self.port_var, width=30)
+        self.port_entry.grid(row=1, column=1, padx=5, pady=5)
+        enable_copy_paste(self.port_entry)
+
+        ttk.Label(self.root, text="База данных:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        self.db_entry = ttk.Entry(self.root, textvariable=self.db_var, width=30)
+        self.db_entry.grid(row=2, column=1, padx=5, pady=5)
+        enable_copy_paste(self.db_entry)
+
+        ttk.Label(self.root, text="Пользователь:").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+        self.user_entry = ttk.Entry(self.root, textvariable=self.user_var, width=30)
+        self.user_entry.grid(row=3, column=1, padx=5, pady=5)
+        enable_copy_paste(self.user_entry)
+
+        ttk.Label(self.root, text="Пароль:").grid(row=4, column=0, padx=5, pady=5, sticky="e")
+        self.pwd_entry = ttk.Entry(self.root, textvariable=self.pwd_var, width=30, show="*")
+        self.pwd_entry.grid(row=4, column=1, padx=5, pady=5)
+        enable_copy_paste(self.pwd_entry)
+
+        ttk.Button(self.root, text="Подключиться", command=self.connect).grid(row=5, column=0, columnspan=2, pady=10)
+
+        self.save_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.root, text="Сохранить параметры", variable=self.save_var).grid(row=6, column=0, columnspan=2)
+
+        self.root.mainloop()
+
+    def load_config(self):
+        if os.path.exists(CONFIG_FILE):
+            self.config.read(CONFIG_FILE)
+        else:
+            self.config["DB"] = {}
+
+    def save_config(self):
+        if self.save_var.get():
+            self.config["DB"] = {
+                "host": self.host_var.get(),
+                "port": self.port_var.get(),
+                "database": self.db_var.get(),
+                "user": self.user_var.get(),
+                "password": self.pwd_var.get()
+            }
+            with open(CONFIG_FILE, "w") as f:
+                self.config.write(f)
+
+    def connect(self):
+        try:
+            conn = psycopg2.connect(
+                host=self.host_var.get(),
+                port=self.port_var.get(),
+                dbname=self.db_var.get(),
+                user=self.user_var.get(),
+                password=self.pwd_var.get()
+            )
+            conn.autocommit = False
+            self.save_config()
+            self.root.destroy()
+            MainWindow(conn)
+        except Exception as e:
+            messagebox.showerror("Ошибка подключения", f"Не удалось подключиться:\n{e}")
+
+
+# ========== ГЛАВНОЕ ОКНО ==========
+class MainWindow:
+    def __init__(self, conn):
+        self.conn = conn
+        self.cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        self.root = tk.Tk()
+        self.root.title("PostgreSQL Manager")
+        self.root.geometry("1200x800")
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TNotebook.Tab", padding=[10, 5], font=("Segoe UI", 10))
+        style.configure("TNotebook", background="#e0e0e0", tabmargins=[1, 1, 1, 0])
+        style.configure("TFrame", background="#f0f0f0")
+        style.configure("TLabelframe", background="#f0f0f0", foreground="#000000", bordercolor="#a0a0a0", relief="solid")
+        style.configure("TLabelframe.Label", background="#f0f0f0", foreground="#000000", font=("Segoe UI", 9, "bold"))
+        style.configure("TLabel", background="#f0f0f0", foreground="#000000", font=("Segoe UI", 9))
+        style.configure("TButton", background="#e1e1e1", foreground="#000000", font=("Segoe UI", 9), borderwidth=1, focusthickness=3)
+        style.map("TButton", background=[("active", "#c0c0c0")])
+        style.configure("TEntry", fieldbackground="#ffffff", foreground="#000000", borderwidth=1)
+        style.configure("TCombobox", fieldbackground="#ffffff", foreground="#000000", arrowcolor="#000000")
+        style.configure("Treeview", background="#ffffff", foreground="#000000", fieldbackground="#ffffff", rowheight=25, borderwidth=1, relief="solid")
+        style.configure("Treeview.Heading", background="#d0d0d0", foreground="#000000", font=("Segoe UI", 9, "bold"), relief="solid")
+        style.map("Treeview", background=[('selected', '#3399ff')], foreground=[('selected', 'white')])
+        style.map("Treeview.Heading", background=[('active', '#c0c0c0')])
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.search_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.search_tab, text="Поиск")
+
+        self.create_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.create_tab, text="Создание таблицы")
+
+        self.data_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.data_tab, text="Данные")
+
+        self.setup_search_tab()
+        self.setup_create_tab()
+        self.setup_data_tab()
+
+        self.root.mainloop()
+
+    # ========== Вкладка поиска ==========
+    def setup_search_tab(self):
+        view_frame = ttk.LabelFrame(self.search_tab, text="Просмотр таблицы/представления", padding=5)
+        view_frame.pack(fill="x", padx=5, pady=5)
+
+        ttk.Label(view_frame, text="Схема:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.schema_combo = ttk.Combobox(view_frame, state="readonly", width=30)
+        self.schema_combo.grid(row=0, column=1, padx=5, pady=5)
+        self.schema_combo.bind("<<ComboboxSelected>>", self.on_view_schema_selected)
+
+        ttk.Label(view_frame, text="Таблица/Представление:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.view_table_combo = ttk.Combobox(view_frame, state="readonly", width=30)
+        self.view_table_combo.grid(row=0, column=3, padx=5, pady=5)
+        self.view_table_combo.bind("<<ComboboxSelected>>", self.on_view_table_selected)
+
+        ttk.Label(view_frame, text="Лимит строк:").grid(row=0, column=4, padx=5, pady=5, sticky="e")
+        self.view_limit_var = tk.IntVar(value=20)
+        ttk.Spinbox(view_frame, from_=1, to=10000, textvariable=self.view_limit_var, width=8).grid(row=0, column=5, padx=5, pady=5)
+
+        filter_view_frame = ttk.Frame(view_frame)
+        filter_view_frame.grid(row=1, column=0, columnspan=6, pady=5, sticky="ew")
+
+        ttk.Label(filter_view_frame, text="Колонка:").pack(side="left", padx=5)
+        self.view_filter_col = ttk.Combobox(filter_view_frame, state="readonly", width=20)
+        self.view_filter_col.pack(side="left", padx=5)
+
+        ttk.Label(filter_view_frame, text="Значение:").pack(side="left", padx=5)
+        self.view_filter_val = ttk.Entry(filter_view_frame, width=40)
+        self.view_filter_val.pack(side="left", padx=5)
+        enable_copy_paste(self.view_filter_val)
+
+        self.filter_mode_var = tk.StringVar(value="exact")
+        ttk.Radiobutton(filter_view_frame, text="Точное", variable=self.filter_mode_var, value="exact", command=self.toggle_range_view).pack(side="left", padx=5)
+        ttk.Radiobutton(filter_view_frame, text="Диапазон", variable=self.filter_mode_var, value="range", command=self.toggle_range_view).pack(side="left", padx=5)
+
+        self.view_range_from = ttk.Entry(filter_view_frame, width=32, state="disabled")
+        self.view_range_from.pack(side="left", padx=5)
+        enable_copy_paste(self.view_range_from)
+
+        ttk.Label(filter_view_frame, text="до").pack(side="left", padx=2)
+        self.view_range_to = ttk.Entry(filter_view_frame, width=32, state="disabled")
+        self.view_range_to.pack(side="left", padx=5)
+        enable_copy_paste(self.view_range_to)
+
+        sort_frame = ttk.Frame(view_frame)
+        sort_frame.grid(row=2, column=0, columnspan=6, pady=5, sticky="ew")
+
+        ttk.Label(sort_frame, text="Сортировка по колонке:").pack(side="left", padx=5)
+        self.view_sort_col = ttk.Combobox(sort_frame, state="readonly", width=20)
+        self.view_sort_col.pack(side="left", padx=5)
+        self.view_sort_col.bind("<<ComboboxSelected>>", lambda e: self.load_view_table())
+
+        self.view_sort_order = tk.StringVar(value="ASC")
+        ttk.Radiobutton(sort_frame, text="По возрастанию", variable=self.view_sort_order, value="ASC", command=self.load_view_table).pack(side="left", padx=5)
+        ttk.Radiobutton(sort_frame, text="По убыванию", variable=self.view_sort_order, value="DESC", command=self.load_view_table).pack(side="left", padx=5)
+
+        btn_frame = ttk.Frame(view_frame)
+        btn_frame.grid(row=3, column=0, columnspan=6, pady=5)
+        ttk.Button(btn_frame, text="Загрузить", command=self.load_view_table).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Сбросить фильтр", command=self.reset_view_filter).pack(side="left", padx=5)
+
+        text_search_frame = ttk.LabelFrame(self.search_tab, text="Полнотекстовый поиск (по всем колонкам)", padding=5)
+        text_search_frame.pack(fill="x", padx=5, pady=5)
+
+        ttk.Label(text_search_frame, text="Поисковый запрос:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(text_search_frame, textvariable=self.search_var, width=60)
+        self.search_entry.grid(row=0, column=1, padx=5, pady=5)
+        enable_copy_paste(self.search_entry)
+
+        ttk.Label(text_search_frame, text="Лимит строк:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.search_limit_var = tk.IntVar(value=20)
+        ttk.Spinbox(text_search_frame, from_=1, to=10000, textvariable=self.search_limit_var, width=6).grid(row=0, column=3, padx=5, pady=5)
+
+        btn_search_frame = ttk.Frame(text_search_frame)
+        btn_search_frame.grid(row=0, column=4, padx=5, pady=5)
+        ttk.Button(btn_search_frame, text="Поиск в таблице/представлении", command=self.search_in_table).pack(side="left", padx=2)
+        ttk.Button(btn_search_frame, text="Поиск по всей БД", command=self.search_all_db).pack(side="left", padx=2)
+
+        found_frame = ttk.Frame(text_search_frame)
+        found_frame.grid(row=1, column=0, columnspan=5, pady=5, sticky="ew")
+        ttk.Label(found_frame, text="Найденные таблицы/представления:").pack(side="left", padx=5)
+        listbox_container = ttk.Frame(found_frame)
+        listbox_container.pack(side="left", fill="x", expand=True, padx=5)
+        self.found_tables_listbox = tk.Listbox(listbox_container, height=6, width=40, exportselection=False, bg="#ffffff", fg="#000000", selectbackground="#3399ff")
+        scrollbar = ttk.Scrollbar(listbox_container, orient="vertical", command=self.found_tables_listbox.yview)
+        self.found_tables_listbox.configure(yscrollcommand=scrollbar.set)
+        self.found_tables_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.found_tables_listbox.bind("<<ListboxSelect>>", self.on_found_table_selected)
+
+        self.selected_table_label = ttk.Label(text_search_frame, text="Выбрана таблица/представление: не выбрано")
+        self.selected_table_label.grid(row=2, column=0, columnspan=5, padx=5, pady=2, sticky="w")
+
+        ttk.Label(text_search_frame, text="Доп. фильтр (колонка):").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+        self.extra_filter_col = ttk.Combobox(text_search_frame, state="readonly", width=20)
+        self.extra_filter_col.grid(row=3, column=1, padx=5, pady=5, sticky="w")
+
+        ttk.Label(text_search_frame, text="Значение:").grid(row=3, column=2, padx=5, pady=5, sticky="e")
+        self.extra_filter_val = ttk.Entry(text_search_frame, width=40)
+        self.extra_filter_val.grid(row=3, column=3, padx=5, pady=5, sticky="w")
+        enable_copy_paste(self.extra_filter_val)
+
+        self.extra_filter_mode_var = tk.StringVar(value="exact")
+        ttk.Radiobutton(text_search_frame, text="Точное", variable=self.extra_filter_mode_var, value="exact").grid(row=3, column=4, padx=5, pady=5)
+        ttk.Radiobutton(text_search_frame, text="Диапазон", variable=self.extra_filter_mode_var, value="range", command=self.toggle_extra_range).grid(row=4, column=0, columnspan=2, padx=5, pady=5)
+
+        self.extra_range_from = ttk.Entry(text_search_frame, width=32, state="disabled")
+        self.extra_range_from.grid(row=4, column=2, padx=5, pady=5)
+        enable_copy_paste(self.extra_range_from)
+
+        ttk.Label(text_search_frame, text="до").grid(row=4, column=3, padx=2, pady=5)
+        self.extra_range_to = ttk.Entry(text_search_frame, width=32, state="disabled")
+        self.extra_range_to.grid(row=4, column=4, padx=5, pady=5)
+        enable_copy_paste(self.extra_range_to)
+
+        sort_extra_frame = ttk.Frame(text_search_frame)
+        sort_extra_frame.grid(row=5, column=0, columnspan=5, pady=5, sticky="ew")
+
+        ttk.Label(sort_extra_frame, text="Сортировка по колонке:").pack(side="left", padx=5)
+        self.search_sort_col = ttk.Combobox(sort_extra_frame, state="readonly", width=20)
+        self.search_sort_col.pack(side="left", padx=5)
+        self.search_sort_col.bind("<<ComboboxSelected>>", lambda e: self.search_in_table())
+
+        self.search_sort_order = tk.StringVar(value="ASC")
+        ttk.Radiobutton(sort_extra_frame, text="По возрастанию", variable=self.search_sort_order, value="ASC", command=self.search_in_table).pack(side="left", padx=5)
+        ttk.Radiobutton(sort_extra_frame, text="По убыванию", variable=self.search_sort_order, value="DESC", command=self.search_in_table).pack(side="left", padx=5)
+
+        result_frame = ttk.LabelFrame(self.search_tab, text="Результаты", padding=5)
+        result_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.result_tree = ttk.Treeview(result_frame, show="headings", selectmode="browse")
+        vsb = ttk.Scrollbar(result_frame, orient="vertical", command=self.result_tree.yview)
+        hsb = ttk.Scrollbar(result_frame, orient="horizontal", command=self.result_tree.xview)
+        self.result_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.result_tree.pack(side="left", fill="both", expand=True)
+        self.result_tree.tag_configure("odd", background="#f0f0f0")
+        self.result_tree.tag_configure("even", background="#ffffff")
+        self.result_tree.bind("<Button-3>", self.show_search_copy_menu)
+        self.result_tree.bind("<Control-c>", self.copy_search_selected_row)
+
+        self.load_view_schemas()
+        self.view_columns = []
+        self.current_found_results = []
+        self.current_selected_table = None
+
+    def load_view_schemas(self):
+        try:
+            self.cur.execute("""
+                SELECT schema_name
+                FROM information_schema.schemata
+                WHERE schema_name NOT IN ('pg_catalog', 'information_schema')
+                AND schema_name NOT LIKE 'pg_temp%'
+                AND schema_name NOT LIKE 'pg_toast%'
+                ORDER BY schema_name
+            """)
+            schemas = [row[0] for row in self.cur.fetchall()]
+            self.schema_combo['values'] = schemas
+            if schemas:
+                self.schema_combo.current(0)
+                self.load_view_objects(schemas[0])
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить список схем:\n{e}")
+
+    def load_view_objects(self, schema_name):
+        try:
+            self.cur.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                AND table_type IN ('BASE TABLE', 'VIEW')
+                ORDER BY table_name
+            """, (schema_name,))
+            objects = [row[0] for row in self.cur.fetchall()]
+            self.view_table_combo['values'] = objects
+            if objects:
+                self.view_table_combo.current(0)
+                self.load_view_columns(schema_name, objects[0])
+            else:
+                self.view_table_combo.set('')
+                self.view_filter_col['values'] = []
+                self.view_sort_col['values'] = []
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить список объектов:\n{e}")
+
+    def load_view_columns(self, schema_name, object_name):
+        try:
+            self.cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """, (schema_name, object_name))
+            self.view_columns = [row[0] for row in self.cur.fetchall()]
+            self.view_filter_col['values'] = self.view_columns
+            self.view_sort_col['values'] = self.view_columns
+            if self.view_columns:
+                self.view_sort_col.current(0)
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить колонки:\n{e}")
+
+    def on_view_schema_selected(self, event=None):
+        schema = self.schema_combo.get()
+        self.load_view_objects(schema)
+
+    def on_view_table_selected(self, event=None):
+        schema = self.schema_combo.get()
+        obj = self.view_table_combo.get()
+        if schema and obj:
+            self.load_view_columns(schema, obj)
+
+    def toggle_range_view(self):
+        if self.filter_mode_var.get() == "range":
+            self.view_filter_val.config(state="disabled")
+            self.view_range_from.config(state="normal")
+            self.view_range_to.config(state="normal")
+        else:
+            self.view_filter_val.config(state="normal")
+            self.view_range_from.config(state="disabled")
+            self.view_range_to.config(state="disabled")
+            self.view_filter_val.focus_set()
+
+    def build_view_where(self):
+        col = self.view_filter_col.get()
+        if not col:
+            return None, []
+        if self.filter_mode_var.get() == "range":
+            from_val = self.view_range_from.get().strip()
+            to_val = self.view_range_to.get().strip()
+            if not from_val and not to_val:
+                return None, []
+            cond = []
+            params = []
+            if from_val:
+                cond.append(sql.SQL("{} >= {}").format(sql.Identifier(col), sql.Placeholder()))
+                params.append(from_val)
+            if to_val:
+                cond.append(sql.SQL("{} <= {}").format(sql.Identifier(col), sql.Placeholder()))
+                params.append(to_val)
+            return sql.SQL(" AND ").join(cond), params
+        else:
+            val = self.view_filter_val.get().strip()
+            if not val:
+                return None, []
+            return sql.SQL("{} = {}").format(sql.Identifier(col), sql.Placeholder()), [val]
+
+    def load_view_table(self):
+        schema = self.schema_combo.get()
+        obj = self.view_table_combo.get()
+        if not schema or not obj:
+            messagebox.showwarning("Предупреждение", "Выберите схему и объект.")
+            return
+        try:
+            self.cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """, (schema, obj))
+            columns = [row[0] for row in self.cur.fetchall()]
+            where_clause, where_params = self.build_view_where()
+            limit = self.view_limit_var.get()
+            sort_col = self.view_sort_col.get()
+            sort_order = self.view_sort_order.get()
+            order_by = None
+            if sort_col and sort_col in columns:
+                order_by = sql.SQL("ORDER BY {} {}").format(sql.Identifier(sort_col), sql.SQL(sort_order))
+            query = sql.SQL("SELECT * FROM {}.{}").format(sql.Identifier(schema), sql.Identifier(obj))
+            if where_clause:
+                query = sql.SQL("{} WHERE {}").format(query, where_clause)
+            if order_by:
+                query = sql.SQL("{} {}").format(query, order_by)
+            if limit > 0:
+                query = sql.SQL("{} LIMIT {}").format(query, sql.Literal(limit))
+            if where_clause:
+                self.cur.execute(query, where_params)
+            else:
+                self.cur.execute(query)
+            rows = self.cur.fetchall()
+            self.display_search_results(rows, columns)
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить данные:\n{e}")
+
+    def reset_view_filter(self):
+        self.view_filter_col.set('')
+        self.view_filter_val.delete(0, tk.END)
+        self.filter_mode_var.set("exact")
+        self.view_range_from.delete(0, tk.END)
+        self.view_range_to.delete(0, tk.END)
+        self.toggle_range_view()
+        self.load_view_table()
+
+    def toggle_extra_range(self):
+        if self.extra_filter_mode_var.get() == "range":
+            self.extra_filter_val.config(state="disabled")
+            self.extra_range_from.config(state="normal")
+            self.extra_range_to.config(state="normal")
+        else:
+            self.extra_filter_val.config(state="normal")
+            self.extra_range_from.config(state="disabled")
+            self.extra_range_to.config(state="disabled")
+            self.extra_filter_val.focus_set()
+
+    def build_extra_where(self):
+        col = self.extra_filter_col.get()
+        if not col:
+            return None, []
+        if self.extra_filter_mode_var.get() == "range":
+            from_val = self.extra_range_from.get().strip()
+            to_val = self.extra_range_to.get().strip()
+            if not from_val and not to_val:
+                return None, []
+            cond = []
+            params = []
+            if from_val:
+                cond.append(sql.SQL("{} >= {}").format(sql.Identifier(col), sql.Placeholder()))
+                params.append(from_val)
+            if to_val:
+                cond.append(sql.SQL("{} <= {}").format(sql.Identifier(col), sql.Placeholder()))
+                params.append(to_val)
+            return sql.SQL(" AND ").join(cond), params
+        else:
+            val = self.extra_filter_val.get().strip()
+            if not val:
+                return None, []
+            return sql.SQL("{} = {}").format(sql.Identifier(col), sql.Placeholder()), [val]
+
+    def search_in_table(self):
+        search_text = self.search_var.get().strip()
+        if not search_text:
+            messagebox.showwarning("Предупреждение", "Введите поисковый запрос.")
+            return
+        if hasattr(self, 'current_selected_table') and self.current_selected_table:
+            schema, obj = self.current_selected_table
+        else:
+            schema = self.schema_combo.get()
+            obj = self.view_table_combo.get()
+        if not schema or not obj:
+            messagebox.showwarning("Предупреждение", "Выберите объект.")
+            return
+        try:
+            self.cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+            """, (schema, obj))
+            all_cols = [row[0] for row in self.cur.fetchall()]
+            conditions = []
+            for col in all_cols:
+                conditions.append(sql.SQL("CAST({} AS TEXT) LIKE %s ESCAPE '\\'").format(sql.Identifier(col)))
+            main_condition = sql.SQL(" OR ").join(conditions)
+            search_pattern = search_text.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+            search_pattern = f"%{search_pattern}%"
+            main_params = [search_pattern] * len(all_cols)
+            extra_where, extra_params = self.build_extra_where()
+            if extra_where:
+                final_where = sql.SQL("({}) AND ({})").format(main_condition, extra_where)
+                params = main_params + extra_params
+            else:
+                final_where = main_condition
+                params = main_params
+            sort_col = self.search_sort_col.get()
+            sort_order = self.search_sort_order.get()
+            order_by = None
+            if sort_col and sort_col in all_cols:
+                order_by = sql.SQL("ORDER BY {} {}").format(sql.Identifier(sort_col), sql.SQL(sort_order))
+            query = sql.SQL("SELECT * FROM {}.{} WHERE {}").format(
+                sql.Identifier(schema), sql.Identifier(obj), final_where)
+            if order_by:
+                query = sql.SQL("{} {}").format(query, order_by)
+            limit = self.search_limit_var.get()
+            if limit > 0:
+                query = sql.SQL("{} LIMIT {}").format(query, sql.Literal(limit))
+            self.cur.execute(query, params)
+            rows = self.cur.fetchall()
+            if rows:
+                columns = [desc[0] for desc in self.cur.description]
+                self.display_search_results(rows, columns)
+            else:
+                messagebox.showinfo("Результат", "Ничего не найдено.")
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Ошибка при поиске:\n{e}")
+
+    def search_all_db(self):
+        search_text = self.search_var.get().strip()
+        if not search_text:
+            messagebox.showwarning("Предупреждение", "Введите поисковый запрос.")
+            return
+        extra_where, extra_params = self.build_extra_where()
+        search_pattern = search_text.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        search_pattern = f"%{search_pattern}%"
+        try:
+            self.cur.execute("""
+                SELECT table_schema, table_name
+                FROM information_schema.tables
+                WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+                AND table_schema NOT LIKE 'pg_temp%'
+                AND table_schema NOT LIKE 'pg_toast%'
+                AND table_type IN ('BASE TABLE', 'VIEW')
+                ORDER BY table_schema, table_name
+            """)
+            objects = [(row[0], row[1]) for row in self.cur.fetchall()]
+            self.current_found_results = []
+            self.found_tables_listbox.delete(0, tk.END)
+            limit = self.search_limit_var.get()
+            for schema, obj in objects:
+                self.cur.execute("""
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema = %s AND table_name = %s
+                """, (schema, obj))
+                all_cols = [row[0] for row in self.cur.fetchall()]
+                conditions = []
+                for col in all_cols:
+                    conditions.append(sql.SQL("CAST({} AS TEXT) LIKE %s ESCAPE '\\'").format(sql.Identifier(col)))
+                main_condition = sql.SQL(" OR ").join(conditions)
+                main_params = [search_pattern] * len(all_cols)
+                if extra_where:
+                    final_where = sql.SQL("({}) AND ({})").format(main_condition, extra_where)
+                    params = main_params + extra_params
+                else:
+                    final_where = main_condition
+                    params = main_params
+                query = sql.SQL("SELECT * FROM {}.{} WHERE {}").format(
+                    sql.Identifier(schema), sql.Identifier(obj), final_where)
+                if limit > 0:
+                    query = sql.SQL("{} LIMIT {}").format(query, sql.Literal(limit))
+                self.cur.execute(query, params)
+                rows = self.cur.fetchall()
+                if rows:
+                    columns = [desc[0] for desc in self.cur.description]
+                    self.current_found_results.append((schema, obj, rows, columns))
+                    self.found_tables_listbox.insert(tk.END, f"{schema}.{obj} ({len(rows)} записей)")
+            if not self.current_found_results:
+                messagebox.showinfo("Результат", "Ничего не найдено.")
+                self.selected_table_label.config(text="Выбрана таблица/представление: не выбрано")
+                self.extra_filter_col['values'] = []
+                self.search_sort_col['values'] = []
+                return
+            if len(self.current_found_results) == 1:
+                self.found_tables_listbox.selection_set(0)
+                self.on_found_table_selected()
+            else:
+                self.selected_table_label.config(text="Выберите объект из списка")
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Ошибка при поиске:\n{e}")
+
+    def on_found_table_selected(self, event=None):
+        selection = self.found_tables_listbox.curselection()
+        if not selection:
+            return
+        idx = selection[0]
+        schema, obj, rows, columns = self.current_found_results[idx]
+        self.display_search_results(rows, columns)
+        self.current_selected_table = (schema, obj)
+        self.selected_table_label.config(text=f"Выбрано: {schema}.{obj}")
+        try:
+            self.cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+            """, (schema, obj))
+            all_cols = [row[0] for row in self.cur.fetchall()]
+            self.search_sort_col['values'] = all_cols
+            if all_cols:
+                self.search_sort_col.current(0)
+            self.extra_filter_col['values'] = all_cols
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить колонки:\n{e}")
+        self._sync_extra_filter_to_view()
+
+    def _sync_extra_filter_to_view(self):
+        col = self.extra_filter_col.get()
+        if col:
+            self.view_filter_col.set(col)
+        else:
+            self.view_filter_col.set('')
+        if self.extra_filter_mode_var.get() == "range":
+            self.filter_mode_var.set("range")
+            self.toggle_range_view()
+            self.view_range_from.delete(0, tk.END)
+            self.view_range_from.insert(0, self.extra_range_from.get())
+            self.view_range_to.delete(0, tk.END)
+            self.view_range_to.insert(0, self.extra_range_to.get())
+        else:
+            self.filter_mode_var.set("exact")
+            self.toggle_range_view()
+            self.view_filter_val.delete(0, tk.END)
+            self.view_filter_val.insert(0, self.extra_filter_val.get())
+
+    def auto_columns(self, tree, columns):
+        default_font = tkfont.nametofont("TkDefaultFont")
+        heading_font = default_font
+        for col in columns:
+            header_text = tree.heading(col, "text") or col
+            header_width = heading_font.measure(header_text) + 40
+            max_data_width = header_width
+            for child in tree.get_children():
+                value = tree.set(child, col)
+                if value:
+                    value_width = default_font.measure(str(value)) + 20
+                    max_data_width = max(max_data_width, value_width)
+            tree.column(col, width=max_data_width, minwidth=header_width, stretch=False)
+        tree.update_idletasks()
+
+    def display_search_results(self, rows, columns):
+        for item in self.result_tree.get_children():
+            self.result_tree.delete(item)
+        self.result_tree["columns"] = columns
+        for col in columns:
+            self.result_tree.heading(col, text=col)
+        for i, row in enumerate(rows):
+            values = [row[col] for col in columns]
+            tag = "even" if i % 2 == 0 else "odd"
+            self.result_tree.insert("", "end", values=values, tags=(tag,))
+        self.auto_columns(self.result_tree, columns)
+
+    def show_search_copy_menu(self, event):
+        item = self.result_tree.identify_row(event.y)
+        if not item:
+            return
+        column = self.result_tree.identify_column(event.x)
+        column_index = int(column[1:]) - 1 if column else None
+        menu = tk.Menu(self.root, tearoff=0)
+        if column_index is not None and 0 <= column_index < len(self.result_tree["columns"]):
+            menu.add_command(label="Копировать ячейку", command=lambda: self.copy_search_cell(item, column_index))
+            menu.add_command(label="Копировать строку", command=lambda: self.copy_search_row(item))
+        menu.post(event.x_root, event.y_root)
+
+    def copy_search_cell(self, item, column_index):
+        values = self.result_tree.item(item, "values")
+        if values and column_index < len(values):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(str(values[column_index]))
+
+    def copy_search_row(self, item):
+        values = self.result_tree.item(item, "values")
+        if values:
+            row_text = "\t".join(str(v) for v in values)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(row_text)
+
+    def copy_search_selected_row(self, event):
+        selected = self.result_tree.selection()
+        if selected:
+            self.copy_search_row(selected[0])
+
+    # ========== Вкладка создания таблицы ==========
+    def setup_create_tab(self):
+        create_frame = ttk.LabelFrame(self.create_tab, text="Создание новой таблицы", padding=5)
+        create_frame.pack(fill="x", padx=10, pady=5)
+
+        row0 = ttk.Frame(create_frame)
+        row0.pack(fill="x", pady=2)
+
+        ttk.Label(row0, text="Схема:").pack(side="left", padx=5)
+        self.create_schema_var = tk.StringVar()
+        self.create_schema_combo = ttk.Combobox(row0, textvariable=self.create_schema_var, state="readonly", width=20)
+        self.create_schema_combo.pack(side="left", padx=5)
+
+        ttk.Label(row0, text="Название таблицы:").pack(side="left", padx=5)
+        self.create_table_name_var = tk.StringVar()
+        self.create_table_name_entry = ttk.Entry(row0, textvariable=self.create_table_name_var, width=25)
+        self.create_table_name_entry.pack(side="left", padx=5)
+        enable_copy_paste(self.create_table_name_entry)
+
+        ttk.Label(row0, text="Кол-во колонок:").pack(side="left", padx=5)
+        self.num_cols_var = tk.IntVar(value=1)
+        ttk.Spinbox(row0, from_=1, to=20, textvariable=self.num_cols_var, width=5).pack(side="left", padx=5)
+        ttk.Button(row0, text="Сформировать поля", command=self.build_column_inputs).pack(side="left", padx=5)
+
+        columns_container = ttk.Frame(create_frame)
+        columns_container.pack(fill="both", expand=True, pady=5)
+
+        canvas = tk.Canvas(columns_container, highlightthickness=0, bg="#f0f0f0", height=200)
+        scrollbar = ttk.Scrollbar(columns_container, orient="vertical", command=canvas.yview)
+        self.columns_frame = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=self.columns_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.columns_canvas = canvas
+        self.column_entries = []
+        self.build_column_inputs()
+
+        ttk.Button(create_frame, text="Создать таблицу", command=self.create_table).pack(pady=5)
+
+        manage_frame = ttk.LabelFrame(self.create_tab, text="Управление существующими таблицами", padding=10)
+        manage_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        ttk.Label(manage_frame, text="Схема:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.manage_schema_combo = ttk.Combobox(manage_frame, state="readonly", width=30)
+        self.manage_schema_combo.grid(row=0, column=1, padx=5, pady=5)
+        self.manage_schema_combo.bind("<<ComboboxSelected>>", self.load_manage_tables)
+
+        ttk.Label(manage_frame, text="Таблица:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.manage_table_combo = ttk.Combobox(manage_frame, state="readonly", width=30)
+        self.manage_table_combo.grid(row=0, column=3, padx=5, pady=5)
+        self.manage_table_combo.bind("<<ComboboxSelected>>", lambda e: self.load_table_columns())
+
+        ttk.Button(manage_frame, text="Удалить таблицу", command=self.delete_table).grid(row=0, column=4, padx=5, pady=5)
+
+        btn_cols_frame = ttk.Frame(manage_frame)
+        btn_cols_frame.grid(row=1, column=0, columnspan=5, pady=10)
+        ttk.Button(btn_cols_frame, text="Добавить колонку", command=self.add_column).pack(side="left", padx=5)
+        ttk.Button(btn_cols_frame, text="Удалить колонку", command=self.drop_column).pack(side="left", padx=5)
+        ttk.Button(btn_cols_frame, text="Изменить тип колонки", command=self.modify_column_type).pack(side="left", padx=5)
+        ttk.Button(btn_cols_frame, text="Добавить ограничение", command=self.add_constraint).pack(side="left", padx=5)
+        ttk.Button(btn_cols_frame, text="Удалить ограничение", command=self.drop_constraint).pack(side="left", padx=5)
+        ttk.Button(btn_cols_frame, text="Добавить SEQUENCE", command=self.add_sequence_column).pack(side="left", padx=5)
+        ttk.Button(btn_cols_frame, text="Удалить SEQUENCE", command=self.drop_sequence_column).pack(side="left", padx=5)
+        ttk.Button(btn_cols_frame, text="Просмотр SEQUENCE", command=self.view_sequences).pack(side="left", padx=5)
+        ttk.Button(btn_cols_frame, text="Обновить список", command=self.load_manage_tables).pack(side="left", padx=5)
+
+        columns_tree_frame = ttk.LabelFrame(manage_frame, text="Структура таблицы", padding=5)
+        columns_tree_frame.grid(row=2, column=0, columnspan=5, sticky="nsew", padx=5, pady=5)
+        manage_frame.grid_rowconfigure(2, weight=1)
+        manage_frame.grid_columnconfigure(0, weight=1)
+
+        self.columns_tree = ttk.Treeview(columns_tree_frame, columns=("name", "type", "nullable", "default", "constraints"), show="headings", height=10)
+        self.columns_tree.heading("name", text="Колонка")
+        self.columns_tree.heading("type", text="Тип")
+        self.columns_tree.heading("nullable", text="NULL")
+        self.columns_tree.heading("default", text="По умолчанию")
+        self.columns_tree.heading("constraints", text="Ограничения")
+        self.columns_tree.column("name", width=150)
+        self.columns_tree.column("type", width=120)
+        self.columns_tree.column("nullable", width=80)
+        self.columns_tree.column("default", width=150)
+        self.columns_tree.column("constraints", width=200)
+        self.columns_tree.pack(side="left", fill="both", expand=True)
+        vsb = ttk.Scrollbar(columns_tree_frame, orient="vertical", command=self.columns_tree.yview)
+        vsb.pack(side="right", fill="y")
+        self.columns_tree.configure(yscrollcommand=vsb.set)
+
+        self.load_create_schemas()
+        self.load_manage_schemas()
+
+    def load_create_schemas(self):
+        try:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT schema_name
+                FROM information_schema.schemata
+                WHERE schema_name NOT IN ('pg_catalog', 'information_schema')
+                AND schema_name NOT LIKE 'pg_temp%'
+                AND schema_name NOT LIKE 'pg_toast%'
+                ORDER BY schema_name
+            """)
+            schemas = [row[0] for row in cur.fetchall()]
+            cur.close()
+            self.create_schema_combo['values'] = schemas
+            if schemas:
+                self.create_schema_combo.current(0)
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить список схем:\n{e}")
+
+    def load_manage_schemas(self):
+        try:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT schema_name
+                FROM information_schema.schemata
+                WHERE schema_name NOT IN ('pg_catalog', 'information_schema')
+                AND schema_name NOT LIKE 'pg_temp%'
+                AND schema_name NOT LIKE 'pg_toast%'
+                ORDER BY schema_name
+            """)
+            schemas = [row[0] for row in cur.fetchall()]
+            cur.close()
+            self.manage_schema_combo['values'] = schemas
+            if schemas:
+                self.manage_schema_combo.current(0)
+                self.load_manage_tables()
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить список схем:\n{e}")
+
+    def load_manage_tables(self, event=None):
+        schema = self.manage_schema_combo.get()
+        if not schema:
+            return
+        try:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+            """, (schema,))
+            tables = [row[0] for row in cur.fetchall()]
+            cur.close()
+            self.manage_table_combo['values'] = tables
+            if tables:
+                self.manage_table_combo.current(0)
+                self.load_table_columns()
+            else:
+                self.manage_table_combo.set('')
+                self.columns_tree.delete(*self.columns_tree.get_children())
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить список таблиц:\n{e}")
+
+    def load_table_columns(self):
+        schema = self.manage_schema_combo.get()
+        table = self.manage_table_combo.get()
+        if not schema or not table:
+            return
+        try:
+            self.cur.execute("""
+                SELECT column_name, data_type, is_nullable, column_default
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                ORDER BY ordinal_position
+            """, (schema, table))
+            cols = self.cur.fetchall()
+            self.columns_tree.delete(*self.columns_tree.get_children())
+            for col in cols:
+                constraints = self.get_column_constraints(schema, table, col[0])
+                self.columns_tree.insert("", "end", values=(col[0], col[1], col[2], col[3] or "", constraints))
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить структуру таблицы:\n{e}")
+
+    def get_column_constraints(self, schema, table, column):
+        try:
+            self.cur.execute("""
+                SELECT tc.constraint_type
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_name = kcu.constraint_name
+                WHERE tc.table_schema = %s AND tc.table_name = %s AND kcu.column_name = %s
+            """, (schema, table, column))
+            constraints = [row[0] for row in self.cur.fetchall()]
+            self.cur.execute("""
+                SELECT is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s AND column_name = %s
+            """, (schema, table, column))
+            is_nullable = self.cur.fetchone()[0]
+            if is_nullable == 'NO':
+                constraints.append('NOT NULL')
+            return ', '.join(constraints) if constraints else ''
+        except:
+            return ''
+
+    def delete_table(self):
+        schema = self.manage_schema_combo.get()
+        table = self.manage_table_combo.get()
+        if not schema or not table:
+            messagebox.showwarning("Предупреждение", "Выберите таблицу для удаления.")
+            return
+        if not messagebox.askyesno("Подтверждение", f"Удалить таблицу {schema}.{table}?\nЭто действие необратимо!"):
+            return
+        try:
+            with self.conn:
+                self.cur.execute(sql.SQL("DROP TABLE {}.{} CASCADE").format(sql.Identifier(schema), sql.Identifier(table)))
+            messagebox.showinfo("Успех", f"Таблица {schema}.{table} удалена.")
+            self.load_manage_tables()
+            self.load_view_objects(self.schema_combo.get())
+            self.load_tables_for_data_schema(self.data_schema_combo.get())
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось удалить таблицу:\n{e}")
+
+    def add_column(self):
+        schema = self.manage_schema_combo.get()
+        table = self.manage_table_combo.get()
+        if not schema or not table:
+            messagebox.showwarning("Предупреждение", "Выберите таблицу.")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.transient(self.root)
+        dialog.attributes('-topmost', True)
+        dialog.after(200, lambda: dialog.attributes('-topmost', False))
+        dialog.title("Добавление колонки")
+        dialog.geometry("450x250")
+
+        ttk.Label(dialog, text="Имя колонки:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        name_entry = ttk.Entry(dialog, width=30)
+        name_entry.grid(row=0, column=1, padx=5, pady=5)
+        enable_copy_paste(name_entry)
+
+        ttk.Label(dialog, text="Тип данных:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        type_descriptions = {
+            "TEXT": "Строка произвольной длины",
+            "INTEGER": "Целое число (от -2e9 до 2e9)",
+            "SERIAL": "Целое число с автоинкрементом (SEQUENCE)",
+            "BIGSERIAL": "Большое целое число с автоинкрементом",
+            "BIGINT": "Большое целое число (от -9e18 до 9e18)",
+            "BOOLEAN": "Логическое значение (TRUE/FALSE)",
+            "DATE": "Дата (год-месяц-день)",
+            "TIMESTAMP": "Дата и время",
+            "NUMERIC": "Точное десятичное число (например, 10.5)",
+            "INET": "IPv4 или IPv6 адрес (например, 192.168.1.1)"
+        }
+        type_combo = ttk.Combobox(dialog, values=list(type_descriptions.keys()), state="readonly", width=38)
+        type_combo.grid(row=1, column=1, padx=5, pady=5)
+        type_combo.current(0)
+
+        desc_label = ttk.Label(dialog, text=type_descriptions[type_combo.get()], font=("Segoe UI", 9), foreground="#666666")
+        desc_label.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky="w")
+
+        def update_desc(event=None):
+            selected_type = type_combo.get()
+            desc_label.config(text=type_descriptions.get(selected_type, ""))
+
+        type_combo.bind("<<ComboboxSelected>>", update_desc)
+
+        ttk.Label(dialog, text="Ограничения:").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+        constraint_combo = ttk.Combobox(dialog, values=["None", "NOT NULL", "UNIQUE", "PRIMARY KEY"], width=28)
+        constraint_combo.current(0)
+        constraint_combo.grid(row=3, column=1, padx=5, pady=5)
+
+        ttk.Label(dialog, text="Значение по умолчанию (для NOT NULL):").grid(row=4, column=0, padx=5, pady=5, sticky="e")
+        default_entry = ttk.Entry(dialog, width=30)
+        default_entry.grid(row=4, column=1, padx=5, pady=5)
+        enable_copy_paste(default_entry)
+
+        ttk.Label(dialog, text="(например: 0, '', now())", font=("Segoe UI", 8), foreground="#666666").grid(row=5, column=1, padx=5, pady=2, sticky="w")
+
+        def do_add():
+            col_name = name_entry.get().strip()
+            col_type = type_combo.get()
+            constraint = constraint_combo.get()
+            default_value = default_entry.get().strip()
+            if not col_name:
+                messagebox.showwarning("Предупреждение", "Введите имя колонки.")
+                return
+            if constraint == "NOT NULL":
+                try:
+                    self.cur.execute(sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                        sql.Identifier(schema), sql.Identifier(table)))
+                    row_count = self.cur.fetchone()[0]
+                    if row_count > 0 and not default_value:
+                        messagebox.showwarning("Предупреждение",
+                            "Таблица содержит данные!\n"
+                            "При добавлении NOT NULL колонки необходимо указать значение по умолчанию\n"
+                            "или добавить колонку без NOT NULL, а затем добавить ограничение.")
+                        return
+                except:
+                    pass
+            sql_col = f"{col_name} {col_type}"
+            if default_value:
+                sql_col += f" DEFAULT {default_value}"
+            if constraint != "None":
+                sql_col += f" {constraint}"
+            try:
+                with self.conn:
+                    self.cur.execute(sql.SQL("ALTER TABLE {}.{} ADD COLUMN {}").format(
+                        sql.Identifier(schema), sql.Identifier(table), sql.SQL(sql_col)))
+                messagebox.showinfo("Успех", "Колонка добавлена.")
+                dialog.destroy()
+                self.load_table_columns()
+                self.load_view_columns(schema, table)
+                self.load_table_data()
+            except Exception as e:
+                self.conn.rollback()
+                messagebox.showerror("Ошибка", f"Не удалось добавить колонку:\n{e}")
+
+        ttk.Button(dialog, text="Добавить", command=do_add).grid(row=6, column=0, columnspan=2, pady=10)
+
+    def drop_column(self):
+        schema = self.manage_schema_combo.get()
+        table = self.manage_table_combo.get()
+        if not schema or not table:
+            messagebox.showwarning("Предупреждение", "Выберите таблицу.")
+            return
+        selected = self.columns_tree.selection()
+        if not selected:
+            messagebox.showwarning("Предупреждение", "Выберите колонку для удаления.")
+            return
+        col_name = self.columns_tree.item(selected[0], "values")[0]
+        if not messagebox.askyesno("Подтверждение", f"Удалить колонку {col_name}?"):
+            return
+        try:
+            with self.conn:
+                self.cur.execute(sql.SQL("ALTER TABLE {}.{} DROP COLUMN {} CASCADE").format(
+                    sql.Identifier(schema), sql.Identifier(table), sql.Identifier(col_name)))
+            messagebox.showinfo("Успех", "Колонка удалена.")
+            self.load_table_columns()
+            self.load_view_columns(schema, table)
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось удалить колонку:\n{e}")
+
+    def modify_column_type(self):
+        schema = self.manage_schema_combo.get()
+        table = self.manage_table_combo.get()
+        if not schema or not table:
+            messagebox.showwarning("Предупреждение", "Выберите таблицу.")
+            return
+        selected = self.columns_tree.selection()
+        if not selected:
+            messagebox.showwarning("Предупреждение", "Выберите колонку.")
+            return
+        col_name = self.columns_tree.item(selected[0], "values")[0]
+        dialog = tk.Toplevel(self.root)
+        dialog.transient(self.root)
+        dialog.attributes('-topmost', True)
+        dialog.after(200, lambda: dialog.attributes('-topmost', False))
+        dialog.title("Изменение типа колонки")
+        dialog.geometry("450x200")
+
+        ttk.Label(dialog, text=f"Колонка: {col_name}").pack(pady=5)
+        ttk.Label(dialog, text="Новый тип:").pack()
+
+        type_descriptions = {
+            "TEXT": "Строка произвольной длины",
+            "INTEGER": "Целое число (от -2e9 до 2e9)",
+            "BIGINT": "Большое целое число (от -9e18 до 9e18)",
+            "BOOLEAN": "Логическое значение (TRUE/FALSE)",
+            "DATE": "Дата (год-месяц-день)",
+            "TIMESTAMP": "Дата и время",
+            "NUMERIC": "Точное десятичное число (например, 10.5)",
+            "INET": "IPv4 или IPv6 адрес (например, 192.168.1.1)"
+        }
+        type_combo = ttk.Combobox(dialog, values=list(type_descriptions.keys()), state="readonly", width=40)
+        type_combo.pack(pady=5)
+        type_combo.current(0)
+
+        desc_label = ttk.Label(dialog, text=type_descriptions[type_combo.get()], font=("Segoe UI", 9), foreground="#666666")
+        desc_label.pack(pady=5)
+
+        def update_desc(event=None):
+            selected_type = type_combo.get()
+            desc_label.config(text=type_descriptions.get(selected_type, ""))
+
+        type_combo.bind("<<ComboboxSelected>>", update_desc)
+
+        def do_change():
+            new_type = type_combo.get()
+            if not new_type:
+                return
+            try:
+                with self.conn:
+                    self.cur.execute(sql.SQL("""
+                        ALTER TABLE {}.{}
+                        ALTER COLUMN {} TYPE {}
+                        USING CAST({} AS {})
+                    """).format(
+                        sql.Identifier(schema),
+                        sql.Identifier(table),
+                        sql.Identifier(col_name),
+                        sql.SQL(new_type),
+                        sql.Identifier(col_name),
+                        sql.SQL(new_type)
+                    ))
+                messagebox.showinfo("Успех", "Тип колонки изменён.")
+                self.load_table_columns()
+                self.load_view_columns(schema, table)
+                dialog.destroy()
+            except Exception as e:
+                self.conn.rollback()
+                messagebox.showerror("Ошибка", f"Не удалось изменить тип колонки:\n{e}")
+
+        ttk.Button(dialog, text="Изменить", command=do_change).pack(pady=5)
+
+    def add_constraint(self):
+        schema = self.manage_schema_combo.get()
+        table = self.manage_table_combo.get()
+        if not schema or not table:
+            messagebox.showwarning("Предупреждение", "Выберите таблицу.")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.transient(self.root)
+        dialog.attributes('-topmost', True)
+        dialog.after(200, lambda: dialog.attributes('-topmost', False))
+        dialog.title("Добавление ограничения")
+        dialog.geometry("500x280")
+
+        ttk.Label(dialog, text="Тип ограничения:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        type_combo = ttk.Combobox(dialog, values=["NOT NULL", "UNIQUE", "PRIMARY KEY", "CHECK"], state="readonly", width=30)
+        type_combo.current(0)
+        type_combo.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(dialog, text="Колонка:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        col_combo = ttk.Combobox(dialog, state="readonly", width=30)
+        col_combo.grid(row=1, column=1, padx=5, pady=5)
+
+        try:
+            self.cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+            """, (schema, table))
+            cols = [row[0] for row in self.cur.fetchall()]
+            col_combo['values'] = cols
+            if cols:
+                col_combo.current(0)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось загрузить колонки:\n{e}")
+
+        ttk.Label(dialog, text="Имя ограничения:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        constraint_name_entry = ttk.Entry(dialog, width=30)
+        constraint_name_entry.grid(row=2, column=1, padx=5, pady=5)
+        enable_copy_paste(constraint_name_entry)
+
+        ttk.Label(dialog, text="Выражение CHECK (например: > 0):").grid(row=3, column=0, padx=5, pady=5, sticky="e")
+        check_entry = ttk.Entry(dialog, width=40)
+        check_entry.grid(row=3, column=1, padx=5, pady=5)
+        check_entry.config(state="disabled")
+        enable_copy_paste(check_entry)
+
+        check_hint_label = ttk.Label(dialog, text="", font=("Segoe UI", 9), foreground="#666666")
+        check_hint_label.grid(row=4, column=0, columnspan=2, padx=5, pady=2, sticky="w")
+
+        def toggle_check(*args):
+            if type_combo.get() == "CHECK":
+                check_entry.config(state="normal")
+                col_combo.config(state="normal")
+                if not constraint_name_entry.get():
+                    constraint_name_entry.insert(0, f"check_{table}_{col_combo.get()}")
+                check_hint_label.config(text=f"Пример: > 0  →  CHECK ({col_combo.get()} > 0)")
+            else:
+                check_entry.config(state="disabled")
+                check_hint_label.config(text="")
+                if not constraint_name_entry.get():
+                    constraint_name_entry.insert(0, f"{type_combo.get().lower()}_{table}_{col_combo.get()}")
+
+        type_combo.bind("<<ComboboxSelected>>", toggle_check)
+        col_combo.bind("<<ComboboxSelected>>", lambda e: toggle_check())
+
+        def do_add():
+            cons_type = type_combo.get()
+            cons_name = constraint_name_entry.get().strip()
+            if not cons_name:
+                messagebox.showwarning("Предупреждение", "Введите имя ограничения.")
+                return
+            try:
+                with self.conn:
+                    if cons_type == "NOT NULL":
+                        col = col_combo.get()
+                        self.cur.execute(sql.SQL("""
+                            ALTER TABLE {}.{} ALTER COLUMN {} SET NOT NULL
+                        """).format(
+                            sql.Identifier(schema),
+                            sql.Identifier(table),
+                            sql.Identifier(col)
+                        ))
+                    elif cons_type == "UNIQUE":
+                        col = col_combo.get()
+                        self.cur.execute(sql.SQL("""
+                            ALTER TABLE {}.{} ADD CONSTRAINT {} UNIQUE ({})
+                        """).format(
+                            sql.Identifier(schema),
+                            sql.Identifier(table),
+                            sql.Identifier(cons_name),
+                            sql.Identifier(col)
+                        ))
+                    elif cons_type == "PRIMARY KEY":
+                        col = col_combo.get()
+                        self.cur.execute(sql.SQL("""
+                            ALTER TABLE {}.{} ADD CONSTRAINT {} PRIMARY KEY ({})
+                        """).format(
+                            sql.Identifier(schema),
+                            sql.Identifier(table),
+                            sql.Identifier(cons_name),
+                            sql.Identifier(col)
+                        ))
+                    elif cons_type == "CHECK":
+                        expr = check_entry.get().strip()
+                        col = col_combo.get()
+                        if not expr:
+                            messagebox.showwarning("Предупреждение", "Введите выражение CHECK.")
+                            return
+                        full_expr = f"{col} {expr}"
+                        self.cur.execute(sql.SQL("""
+                            ALTER TABLE {}.{} ADD CONSTRAINT {} CHECK ({})
+                        """).format(
+                            sql.Identifier(schema),
+                            sql.Identifier(table),
+                            sql.Identifier(cons_name),
+                            sql.SQL(full_expr)
+                        ))
+                    messagebox.showinfo("Успех", f"Ограничение {cons_type} добавлено.")
+                    dialog.destroy()
+                    self.load_table_columns()
+                    self.load_view_columns(schema, table)
+            except psycopg2.errors.DuplicateObject:
+                self.conn.rollback()
+                messagebox.showerror("Ошибка", f"Ограничение с именем '{cons_name}' уже существует.\nВыберите другое имя.")
+            except Exception as e:
+                self.conn.rollback()
+                messagebox.showerror("Ошибка", f"Не удалось добавить ограничение:\n{e}")
+
+        ttk.Button(dialog, text="Добавить", command=do_add).grid(row=5, column=0, columnspan=2, pady=10)
+
+    def drop_constraint(self):
+        schema = self.manage_schema_combo.get()
+        table = self.manage_table_combo.get()
+        if not schema or not table:
+            messagebox.showwarning("Предупреждение", "Выберите таблицу.")
+            return
+        try:
+            self.cur.execute("""
+                SELECT conname, contype
+                FROM pg_constraint
+                WHERE conrelid = %s::regclass
+                AND contype IN ('c', 'u', 'p', 'f')
+            """, (f"{schema}.{table}",))
+            constraints = [(row[0], row[1]) for row in self.cur.fetchall()]
+            self.cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s AND is_nullable = 'NO'
+            """, (schema, table))
+            not_null_cols = [row[0] for row in self.cur.fetchall()]
+            constraint_list = []
+            for name, type_ in constraints:
+                type_desc = {'c': 'CHECK', 'u': 'UNIQUE', 'p': 'PRIMARY KEY', 'f': 'FOREIGN KEY'}.get(type_, type_)
+                constraint_list.append(f"{name} ({type_desc})")
+            for col in not_null_cols:
+                constraint_list.append(f"NOT NULL ({col})")
+            if not constraint_list:
+                messagebox.showinfo("Информация", "Нет ограничений для удаления.")
+                return
+            dialog = tk.Toplevel(self.root)
+            dialog.transient(self.root)
+            dialog.attributes('-topmost', True)
+            dialog.after(200, lambda: dialog.attributes('-topmost', False))
+            dialog.title("Удаление ограничения")
+            dialog.geometry("400x200")
+
+            ttk.Label(dialog, text="Выберите ограничение:").pack(pady=5)
+            constraint_var = tk.StringVar()
+            combo = ttk.Combobox(dialog, textvariable=constraint_var, values=constraint_list, state="readonly", width=50)
+            combo.pack(pady=5)
+            if constraint_list:
+                combo.current(0)
+
+            def do_drop():
+                selected = constraint_var.get()
+                if not selected:
+                    return
+                try:
+                    with self.conn:
+                        if selected.startswith("NOT NULL"):
+                            col_name = selected.split("(")[1].rstrip(")")
+                            self.cur.execute(sql.SQL("""
+                                ALTER TABLE {}.{} ALTER COLUMN {} DROP NOT NULL
+                            """).format(
+                                sql.Identifier(schema),
+                                sql.Identifier(table),
+                                sql.Identifier(col_name)
+                            ))
+                        else:
+                            cons_name = selected.split(" ")[0]
+                            self.cur.execute(sql.SQL("""
+                                ALTER TABLE {}.{} DROP CONSTRAINT {}
+                            """).format(
+                                sql.Identifier(schema),
+                                sql.Identifier(table),
+                                sql.Identifier(cons_name)
+                            ))
+                    messagebox.showinfo("Успех", "Ограничение удалено.")
+                    dialog.destroy()
+                    self.load_table_columns()
+                except psycopg2.errors.UndefinedObject:
+                    self.conn.rollback()
+                    messagebox.showerror("Ошибка", f"Ограничение '{cons_name}' не найдено.\nОбновите список таблиц.")
+                except Exception as e:
+                    self.conn.rollback()
+                    messagebox.showerror("Ошибка", f"Не удалось удалить: {e}")
+
+            ttk.Button(dialog, text="Удалить", command=do_drop).pack(pady=10)
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Ошибка: {e}")
+
+    def add_sequence_column(self):
+        schema = self.manage_schema_combo.get()
+        table = self.manage_table_combo.get()
+        if not schema or not table:
+            messagebox.showwarning("Предупреждение", "Выберите таблицу.")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.transient(self.root)
+        dialog.attributes('-topmost', True)
+        dialog.after(200, lambda: dialog.attributes('-topmost', False))
+        dialog.title("Добавление колонки с автоинкрементом")
+        dialog.geometry("450x200")
+
+        ttk.Label(dialog, text="Имя колонки:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        name_entry = ttk.Entry(dialog, width=30)
+        name_entry.insert(0, "id")
+        name_entry.grid(row=0, column=1, padx=5, pady=5)
+        enable_copy_paste(name_entry)
+
+        ttk.Label(dialog, text="Тип:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        type_combo = ttk.Combobox(dialog, values=["SERIAL", "BIGSERIAL"], state="readonly", width=28)
+        type_combo.current(0)
+        type_combo.grid(row=1, column=1, padx=5, pady=5)
+
+        ttk.Label(dialog, text="Ограничения:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        constraint_combo = ttk.Combobox(dialog, values=["PRIMARY KEY", "UNIQUE", "None"], state="readonly", width=28)
+        constraint_combo.current(0)
+        constraint_combo.grid(row=2, column=1, padx=5, pady=5)
+
+        def do_add():
+            col_name = name_entry.get().strip()
+            col_type = type_combo.get()
+            constraint = constraint_combo.get()
+            if not col_name:
+                messagebox.showwarning("Предупреждение", "Введите имя колонки.")
+                return
+            try:
+                with self.conn:
+                    sql_col = f"{col_name} {col_type}"
+                    if constraint == "PRIMARY KEY":
+                        sql_col += " PRIMARY KEY"
+                    self.cur.execute(sql.SQL("""
+                        ALTER TABLE {}.{} ADD COLUMN {}
+                    """).format(
+                        sql.Identifier(schema),
+                        sql.Identifier(table),
+                        sql.SQL(sql_col)
+                    ))
+                messagebox.showinfo("Успех", "Колонка с автоинкрементом добавлена.")
+                dialog.destroy()
+                self.load_table_columns()
+                self.load_view_columns(schema, table)
+                self.load_table_data()
+            except Exception as e:
+                self.conn.rollback()
+                messagebox.showerror("Ошибка", f"Ошибка: {e}")
+
+        ttk.Button(dialog, text="Добавить", command=do_add).grid(row=3, column=0, columnspan=2, pady=10)
+
+    def drop_sequence_column(self):
+        schema = self.manage_schema_combo.get()
+        table = self.manage_table_combo.get()
+        if not schema or not table:
+            messagebox.showwarning("Предупреждение", "Выберите таблицу.")
+            return
+        selected = self.columns_tree.selection()
+        if not selected:
+            messagebox.showwarning("Предупреждение", "Выберите колонку для удаления.")
+            return
+        col_info = self.columns_tree.item(selected[0], "values")
+        col_name = col_info[0]
+        col_default = col_info[3] if len(col_info) > 3 else ""
+        is_sequence = col_default and 'nextval' in col_default.lower()
+        if not is_sequence:
+            messagebox.showwarning("Предупреждение",
+                "Выбранная колонка не использует SEQUENCE.\n"
+                "Используйте обычное удаление колонки.")
+            return
+        if not messagebox.askyesno("Подтверждение",
+            f"Удалить колонку {col_name} с автоинкрементом?\n"
+            "Связанная последовательность также будет удалена."):
+            return
+        try:
+            with self.conn:
+                self.cur.execute(sql.SQL("""
+                    ALTER TABLE {}.{} DROP COLUMN {} CASCADE
+                """).format(
+                    sql.Identifier(schema),
+                    sql.Identifier(table),
+                    sql.Identifier(col_name)
+                ))
+            messagebox.showinfo("Успех", "Колонка с автоинкрементом удалена.")
+            self.load_table_columns()
+            self.load_view_columns(schema, table)
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось удалить колонку:\n{e}")
+
+    def view_sequences(self):
+        schema = self.manage_schema_combo.get()
+        if not schema:
+            messagebox.showwarning("Предупреждение", "Выберите схему.")
+            return
+        try:
+            self.cur.execute("""
+                SELECT sequencename, last_value, start_value, increment_by
+                FROM pg_sequences
+                WHERE schemaname = %s
+                ORDER BY sequencename
+            """, (schema,))
+            sequences = self.cur.fetchall()
+            if not sequences:
+                messagebox.showinfo("Информация", "Нет последовательностей в схеме.")
+                return
+            dialog = tk.Toplevel(self.root)
+            dialog.transient(self.root)
+            dialog.attributes('-topmost', True)
+            dialog.after(200, lambda: dialog.attributes('-topmost', False))
+            dialog.title(f"Последовательности в схеме {schema}")
+            dialog.geometry("700x400")
+
+            tree = ttk.Treeview(dialog, columns=("name", "last", "start", "increment"),
+                show="headings", height=15)
+            tree.heading("name", text="Имя")
+            tree.heading("last", text="Последнее значение")
+            tree.heading("start", text="Начальное значение")
+            tree.heading("increment", text="Шаг")
+            tree.column("name", width=200)
+            tree.column("last", width=150)
+            tree.column("start", width=150)
+            tree.column("increment", width=100)
+            for seq in sequences:
+                tree.insert("", "end", values=seq)
+            tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+            btn_frame = ttk.Frame(dialog)
+            btn_frame.pack(pady=5)
+
+            def delete_sequence():
+                selected = tree.selection()
+                if not selected:
+                    messagebox.showwarning("Предупреждение", "Выберите последовательность.")
+                    return
+                seq_name = tree.item(selected[0], "values")[0]
+                if not messagebox.askyesno("Подтверждение",
+                    f"Удалить последовательность {schema}.{seq_name}?\n"
+                    "Внимание: это может нарушить работу колонок с автоинкрементом!"):
+                    return
+                try:
+                    with self.conn:
+                        self.cur.execute(sql.SQL("DROP SEQUENCE {}.{}").format(
+                            sql.Identifier(schema),
+                            sql.Identifier(seq_name)
+                        ))
+                    messagebox.showinfo("Успех", "Последовательность удалена.")
+                    dialog.destroy()
+                    self.view_sequences()
+                    self.load_table_columns()
+                except Exception as e:
+                    self.conn.rollback()
+                    messagebox.showerror("Ошибка", f"Не удалось удалить последовательность:\n{e}")
+
+            ttk.Button(btn_frame, text="Удалить выбранную", command=delete_sequence).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Обновить", command=lambda: [dialog.destroy(), self.view_sequences()]).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Закрыть", command=dialog.destroy).pack(side="left", padx=5)
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить последовательности:\n{e}")
+
+    def build_column_inputs(self):
+        for widget in self.columns_frame.winfo_children():
+            widget.destroy()
+        self.column_entries = []
+        num_cols = self.num_cols_var.get()
+
+        ttk.Label(self.columns_frame, text="Имя колонки").grid(row=0, column=0, padx=5, pady=2)
+        ttk.Label(self.columns_frame, text="Тип данных").grid(row=0, column=1, padx=5, pady=2)
+        ttk.Label(self.columns_frame, text="Описание").grid(row=0, column=2, padx=5, pady=2)
+        ttk.Label(self.columns_frame, text="Ограничения").grid(row=0, column=3, padx=5, pady=2)
+
+        type_descriptions = {
+            "TEXT": "Строка произвольной длины",
+            "INTEGER": "Целое число (от -2e9 до 2e9)",
+            "SERIAL": "Целое число с автоинкрементом (SEQUENCE)",
+            "BIGSERIAL": "Большое целое число с автоинкрементом",
+            "BIGINT": "Большое целое число (от -9e18 до 9e18)",
+            "BOOLEAN": "Логическое значение (TRUE/FALSE)",
+            "DATE": "Дата (год-месяц-день)",
+            "TIMESTAMP": "Дата и время",
+            "NUMERIC": "Точное десятичное число (например, 10.5)",
+            "INET": "IPv4 или IPv6 адрес (например, 192.168.1.1)"
+        }
+        constraint_options = ["None", "NOT NULL", "UNIQUE", "PRIMARY KEY"]
+
+        for i in range(num_cols):
+            name_entry = ttk.Entry(self.columns_frame, width=20)
+            name_entry.grid(row=i+1, column=0, padx=5, pady=2)
+            enable_copy_paste(name_entry)
+
+            type_combo = ttk.Combobox(self.columns_frame, values=list(type_descriptions.keys()), state="readonly")
+            type_combo.current(0)
+            type_combo.grid(row=i+1, column=1, padx=5, pady=2)
+
+            desc_label = ttk.Label(self.columns_frame, text=type_descriptions[type_combo.get()], width=30, anchor="w")
+            desc_label.grid(row=i+1, column=2, padx=5, pady=2)
+
+            constraint_combo = ttk.Combobox(self.columns_frame, values=constraint_options, state="readonly")
+            constraint_combo.current(0)
+            constraint_combo.grid(row=i+1, column=3, padx=5, pady=2)
+
+            def update_desc(event, lbl=desc_label, combo=type_combo):
+                lbl.config(text=type_descriptions.get(combo.get(), ""))
+
+            type_combo.bind("<<ComboboxSelected>>", update_desc)
+            self.column_entries.append((name_entry, type_combo, constraint_combo, desc_label))
+
+        self.columns_frame.update_idletasks()
+        self.columns_canvas.configure(scrollregion=self.columns_canvas.bbox("all"))
+
+    def create_table(self):
+        table_name = self.create_table_name_var.get().strip()
+        schema_name = self.create_schema_var.get().strip()
+        if not table_name:
+            messagebox.showwarning("Предупреждение", "Введите название таблицы.")
+            return
+        if not schema_name:
+            messagebox.showwarning("Предупреждение", "Выберите схему.")
+            return
+        columns = []
+        for name_entry, type_combo, constraint_combo, _ in self.column_entries:
+            col_name = name_entry.get().strip()
+            col_type = type_combo.get()
+            constraint = constraint_combo.get()
+            if not col_name:
+                messagebox.showwarning("Предупреждение", "Все колонки должны иметь имя.")
+                return
+            if col_type in ["SERIAL", "BIGSERIAL"]:
+                col_def = f"{col_name} {col_type}"
+                if constraint == "PRIMARY KEY":
+                    col_def += " PRIMARY KEY"
+            else:
+                col_def = f"{col_name} {col_type}"
+                if constraint != "None":
+                    col_def += f" {constraint}"
+            columns.append(col_def)
+        if not columns:
+            messagebox.showwarning("Предупреждение", "Добавьте хотя бы одну колонку.")
+            return
+        query = sql.SQL("CREATE TABLE {}.{} ({})").format(
+            sql.Identifier(schema_name),
+            sql.Identifier(table_name),
+            sql.SQL(", ").join(sql.SQL(col) for col in columns)
+        )
+        try:
+            with self.conn:
+                self.cur.execute(query)
+            messagebox.showinfo("Успех", f"Таблица '{schema_name}.{table_name}' создана.")
+            self.load_view_objects(self.schema_combo.get())
+            self.load_manage_tables()
+            self.load_tables_for_data_schema(self.data_schema_combo.get())
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось создать таблицу:\n{e}")
+
+    # ========== Вкладка данных ==========
+    def setup_data_tab(self):
+        control_frame = ttk.LabelFrame(self.data_tab, text="Управление", padding=5)
+        control_frame.pack(fill="x", padx=5, pady=5)
+
+        ttk.Label(control_frame, text="Схема:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.data_schema_combo = ttk.Combobox(control_frame, state="readonly", width=30)
+        self.data_schema_combo.grid(row=0, column=1, padx=5, pady=5)
+        self.data_schema_combo.bind("<<ComboboxSelected>>", self.on_data_schema_selected)
+
+        ttk.Label(control_frame, text="Таблица:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.data_table_combo = ttk.Combobox(control_frame, state="readonly", width=30)
+        self.data_table_combo.grid(row=0, column=3, padx=5, pady=5)
+
+        ttk.Label(control_frame, text="Строк на странице:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.limit_var = tk.IntVar(value=20)
+        ttk.Spinbox(control_frame, from_=1, to=1000, textvariable=self.limit_var, width=5).grid(row=1, column=1, padx=5, pady=5, sticky="w")
+
+        ttk.Label(control_frame, text="Смещение:").grid(row=1, column=2, padx=5, pady=5, sticky="e")
+        self.offset_var = tk.IntVar(value=0)
+        self.offset_entry = ttk.Entry(control_frame, textvariable=self.offset_var, width=8)
+        self.offset_entry.grid(row=1, column=3, padx=5, pady=5, sticky="w")
+        enable_copy_paste(self.offset_entry)
+
+        nav_frame = ttk.Frame(control_frame)
+        nav_frame.grid(row=1, column=4, padx=10, pady=5)
+        ttk.Button(nav_frame, text="Предыдущая", command=self.prev_page).pack(side="left", padx=2)
+        ttk.Button(nav_frame, text="Следующая", command=self.next_page).pack(side="left", padx=2)
+        ttk.Button(nav_frame, text="Загрузить", command=self.load_table_data).pack(side="left", padx=2)
+
+        ttk.Label(control_frame, text="Всего строк:").grid(row=2, column=0, padx=5, pady=5, sticky="e")
+        self.total_label = ttk.Label(control_frame, text="0")
+        self.total_label.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+
+        sort_data_frame = ttk.LabelFrame(control_frame, text="Сортировка", padding=5)
+        sort_data_frame.grid(row=2, column=2, columnspan=3, padx=5, pady=5, sticky="ew")
+
+        ttk.Label(sort_data_frame, text="Колонка:").pack(side="left", padx=5)
+        self.data_sort_col = ttk.Combobox(sort_data_frame, state="readonly", width=20)
+        self.data_sort_col.pack(side="left", padx=5)
+        self.data_sort_col.bind("<<ComboboxSelected>>", lambda e: self.load_table_data())
+
+        self.data_sort_order = tk.StringVar(value="ASC")
+        ttk.Radiobutton(sort_data_frame, text="По возрастанию", variable=self.data_sort_order, value="ASC", command=self.load_table_data).pack(side="left", padx=5)
+        ttk.Radiobutton(sort_data_frame, text="По убыванию", variable=self.data_sort_order, value="DESC", command=self.load_table_data).pack(side="left", padx=5)
+
+        filter_frame = ttk.LabelFrame(self.data_tab, text="Фильтр", padding=5)
+        filter_frame.pack(fill="x", padx=5, pady=5)
+
+        ttk.Label(filter_frame, text="Колонка:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.filter_column_combo = ttk.Combobox(filter_frame, state="readonly", width=30)
+        self.filter_column_combo.grid(row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(filter_frame, text="Значение:").grid(row=0, column=2, padx=5, pady=5, sticky="e")
+        self.filter_value_entry = ttk.Entry(filter_frame, width=40)
+        self.filter_value_entry.grid(row=0, column=3, padx=5, pady=5)
+        enable_copy_paste(self.filter_value_entry)
+
+        self.data_filter_mode_var = tk.StringVar(value="exact")
+        ttk.Radiobutton(filter_frame, text="Точное", variable=self.data_filter_mode_var, value="exact").grid(row=0, column=4, padx=5, pady=5)
+        ttk.Radiobutton(filter_frame, text="Диапазон", variable=self.data_filter_mode_var, value="range", command=self.toggle_range).grid(row=1, column=0, columnspan=2, padx=5, pady=5)
+
+        self.filter_range_from = ttk.Entry(filter_frame, width=32, state="disabled")
+        self.filter_range_from.grid(row=1, column=2, padx=5, pady=5)
+        enable_copy_paste(self.filter_range_from)
+
+        ttk.Label(filter_frame, text="до").grid(row=1, column=3, padx=2, pady=5)
+        self.filter_range_to = ttk.Entry(filter_frame, width=32, state="disabled")
+        self.filter_range_to.grid(row=1, column=4, padx=5, pady=5)
+        enable_copy_paste(self.filter_range_to)
+
+        btn_filter_frame = ttk.Frame(filter_frame)
+        btn_filter_frame.grid(row=2, column=0, columnspan=5, pady=5)
+        ttk.Button(btn_filter_frame, text="Применить фильтр", command=self.apply_filter).pack(side="left", padx=5)
+        ttk.Button(btn_filter_frame, text="Сбросить фильтр", command=self.reset_filter).pack(side="left", padx=5)
+
+        data_result_frame = ttk.LabelFrame(self.data_tab, text="Содержимое таблицы", padding=5)
+        data_result_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.data_tree = ttk.Treeview(data_result_frame, show="headings", selectmode="browse")
+        vsb = ttk.Scrollbar(data_result_frame, orient="vertical", command=self.data_tree.yview)
+        hsb = ttk.Scrollbar(data_result_frame, orient="horizontal", command=self.data_tree.xview)
+        self.data_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.data_tree.pack(side="left", fill="both", expand=True)
+        self.data_tree.tag_configure("odd", background="#f0f0f0")
+        self.data_tree.tag_configure("even", background="#ffffff")
+        self.data_tree.bind("<Button-3>", self.show_copy_menu)
+        self.data_tree.bind("<Control-c>", self.copy_selected_row)
+
+        edit_frame = ttk.Frame(self.data_tab)
+        edit_frame.pack(fill="x", padx=5, pady=5)
+        ttk.Button(edit_frame, text="Добавить запись", command=self.add_record).pack(side="left", padx=5)
+        ttk.Button(edit_frame, text="Редактировать запись", command=self.edit_record).pack(side="left", padx=5)
+        ttk.Button(edit_frame, text="Удалить запись", command=self.delete_record).pack(side="left", padx=5)
+        ttk.Button(edit_frame, text="Обновить", command=self.load_table_data).pack(side="left", padx=5)
+
+        self.data_columns = []
+        self.data_types = {}
+        self.column_constraints = {}
+        self.current_data_schema = None
+        self.current_data_table = None
+        self.current_where_clause = None
+        self.current_where_params = []
+        self.total_rows = 0
+        self.load_data_schemas()
+
+    def toggle_range(self):
+        if self.data_filter_mode_var.get() == "range":
+            self.filter_value_entry.config(state="disabled")
+            self.filter_range_from.config(state="normal")
+            self.filter_range_to.config(state="normal")
+        else:
+            self.filter_value_entry.config(state="normal")
+            self.filter_range_from.config(state="disabled")
+            self.filter_range_to.config(state="disabled")
+            self.filter_value_entry.focus_set()
+
+    def build_where_clause(self):
+        if not self.current_data_schema or not self.current_data_table:
+            return None, []
+        column = self.filter_column_combo.get()
+        if not column:
+            return None, []
+        if self.data_filter_mode_var.get() == "range":
+            from_val = self.filter_range_from.get().strip()
+            to_val = self.filter_range_to.get().strip()
+            if not from_val and not to_val:
+                return None, []
+            conditions = []
+            params = []
+            if from_val:
+                conditions.append(sql.SQL("{} >= {}").format(sql.Identifier(column), sql.Placeholder()))
+                params.append(from_val)
+            if to_val:
+                conditions.append(sql.SQL("{} <= {}").format(sql.Identifier(column), sql.Placeholder()))
+                params.append(to_val)
+            return sql.SQL(" AND ").join(conditions), params
+        else:
+            value = self.filter_value_entry.get().strip()
+            if not value:
+                return None, []
+            return sql.SQL("{} = {}").format(sql.Identifier(column), sql.Placeholder()), [value]
+
+    def apply_filter(self):
+        self.offset_var.set(0)
+        self.load_table_data()
+
+    def reset_filter(self):
+        self.filter_column_combo.set('')
+        self.filter_value_entry.delete(0, tk.END)
+        self.data_filter_mode_var.set("exact")
+        self.filter_range_from.delete(0, tk.END)
+        self.filter_range_to.delete(0, tk.END)
+        self.toggle_range()
+        self.apply_filter()
+
+    def load_table_data(self):
+        schema = self.data_schema_combo.get()
+        table = self.data_table_combo.get()
+        if not schema or not table:
+            messagebox.showwarning("Предупреждение", "Выберите схему и таблицу.")
+            return
+        self.current_data_schema = schema
+        self.current_data_table = table
+        try:
+            self.cur.execute("""
+                SELECT
+                c.column_name,
+                c.data_type,
+                c.is_nullable,
+                c.column_default,
+                tc.constraint_type
+                FROM information_schema.columns c
+                LEFT JOIN information_schema.key_column_usage kcu
+                ON kcu.table_schema = c.table_schema
+                AND kcu.table_name = c.table_name
+                AND kcu.column_name = c.column_name
+                LEFT JOIN information_schema.table_constraints tc
+                ON tc.table_schema = kcu.table_schema
+                AND tc.table_name = kcu.table_name
+                AND tc.constraint_name = kcu.constraint_name
+                WHERE c.table_schema = %s AND c.table_name = %s
+                ORDER BY c.ordinal_position
+            """, (schema, table))
+            cols_info = self.cur.fetchall()
+            self.data_columns = []
+            self.data_types = {}
+            self.column_constraints = {}
+            for col in cols_info:
+                col_name = col[0]
+                self.data_columns.append(col_name)
+                self.data_types[col_name] = col[1]
+                constraints = []
+                if col[2] == 'NO':
+                    constraints.append("NOT NULL")
+                if col[4] == 'PRIMARY KEY':
+                    constraints.append("PRIMARY KEY")
+                elif col[4] == 'UNIQUE':
+                    constraints.append("UNIQUE")
+                self.column_constraints[col_name] = ", ".join(constraints) if constraints else "Нет"
+            self.filter_column_combo['values'] = self.data_columns
+            self.data_sort_col['values'] = self.data_columns
+            where_clause, where_params = self.build_where_clause()
+            self.current_where_clause = where_clause
+            self.current_where_params = where_params
+            count_query = sql.SQL("SELECT COUNT(*) FROM {}.{}").format(
+                sql.Identifier(schema), sql.Identifier(table))
+            if where_clause:
+                count_query = sql.SQL("{} WHERE {}").format(count_query, where_clause)
+            if where_clause:
+                self.cur.execute(count_query, where_params)
+            else:
+                self.cur.execute(count_query)
+            self.total_rows = self.cur.fetchone()[0]
+            self.total_label.config(text=str(self.total_rows))
+            limit = self.limit_var.get()
+            offset = self.offset_var.get()
+            if offset >= self.total_rows:
+                offset = max(0, self.total_rows - limit)
+            self.offset_var.set(offset)
+            sort_col = self.data_sort_col.get()
+            sort_order = self.data_sort_order.get()
+            order_by = None
+            if sort_col and sort_col in self.data_columns:
+                order_by = sql.SQL("ORDER BY {} {}").format(sql.Identifier(sort_col), sql.SQL(sort_order))
+            query = sql.SQL("SELECT * FROM {}.{}").format(sql.Identifier(schema), sql.Identifier(table))
+            if where_clause:
+                query = sql.SQL("{} WHERE {}").format(query, where_clause)
+            if order_by:
+                query = sql.SQL("{} {}").format(query, order_by)
+            if limit > 0:
+                query = sql.SQL("{} LIMIT {} OFFSET {}").format(query, sql.Literal(limit), sql.Literal(offset))
+            if where_clause:
+                self.cur.execute(query, where_params)
+            else:
+                self.cur.execute(query)
+            rows = self.cur.fetchall()
+            self.display_data_rows(rows, offset)
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить данные:\n{e}")
+
+    def display_data_rows(self, rows, offset):
+        for item in self.data_tree.get_children():
+            self.data_tree.delete(item)
+        columns_with_number = ["№"] + self.data_columns
+        self.data_tree["columns"] = columns_with_number
+        for col in columns_with_number:
+            self.data_tree.heading(col, text=col)
+        for i, row in enumerate(rows):
+            row_num = offset + i + 1
+            values = [row_num]
+            for col in self.data_columns:
+                val = row[col]
+                values.append("" if val is None else str(val))
+            tag = "even" if i % 2 == 0 else "odd"
+            self.data_tree.insert("", "end", values=values, tags=(tag,))
+        self.auto_columns(self.data_tree, columns_with_number)
+
+    def prev_page(self):
+        limit = self.limit_var.get()
+        offset = self.offset_var.get() - limit
+        if offset < 0:
+            offset = 0
+        self.offset_var.set(offset)
+        self.load_table_data()
+
+    def next_page(self):
+        limit = self.limit_var.get()
+        offset = self.offset_var.get() + limit
+        if offset >= self.total_rows:
+            offset = max(0, self.total_rows - limit)
+        self.offset_var.set(offset)
+        self.load_table_data()
+
+    def get_selected_record(self):
+        selected = self.data_tree.selection()
+        if not selected:
+            messagebox.showwarning("Предупреждение", "Выберите запись.")
+            return None
+        item = selected[0]
+        values = self.data_tree.item(item, "values")
+        if not values or len(values) <= 1:
+            return None
+        return values[1:]
+
+    def add_record(self):
+        self.open_record_dialog(is_edit=False)
+
+    def edit_record(self):
+        selected_values = self.get_selected_record()
+        if not selected_values:
+            return
+        self.open_record_dialog(is_edit=True, initial_values=selected_values, old_values=list(selected_values))
+
+    def delete_record(self):
+        if not self.current_data_schema or not self.current_data_table:
+            messagebox.showwarning("Предупреждение", "Сначала загрузите таблицу.")
+            return
+        selected_values = self.get_selected_record()
+        if not selected_values:
+            return
+        if not messagebox.askyesno("Подтверждение", "Удалить выбранную запись?"):
+            return
+        try:
+            where_parts = []
+            where_params = []
+            for i, col in enumerate(self.data_columns):
+                val = selected_values[i]
+                if val is None or val == "":
+                    where_parts.append(sql.SQL("{} IS NULL").format(sql.Identifier(col)))
+                else:
+                    where_parts.append(sql.SQL("{} = {}").format(sql.Identifier(col), sql.Placeholder()))
+                    where_params.append(val)
+            where_clause = sql.SQL(" AND ").join(where_parts)
+            query = sql.SQL("DELETE FROM {}.{} WHERE {}").format(
+                sql.Identifier(self.current_data_schema),
+                sql.Identifier(self.current_data_table),
+                where_clause
+            )
+            with self.conn:
+                self.cur.execute(query, where_params)
+            messagebox.showinfo("Успех", "Запись удалена.")
+            self.load_table_data()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось удалить запись:\n{e}")
+
+    def open_record_dialog(self, is_edit=False, initial_values=None, old_values=None):
+        if is_edit and old_values is None:
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.transient(self.root)
+        dialog.attributes('-topmost', True)
+        dialog.after(200, lambda: dialog.attributes('-topmost', False))
+        dialog.title("Редактирование записи" if is_edit else "Добавление записи")
+        dialog.geometry("600x450")
+        dialog.resizable(True, True)
+
+        main_frame = ttk.Frame(dialog)
+        main_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        canvas = tk.Canvas(main_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        inner_frame = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        entries = {}
+        ttk.Label(inner_frame, text="Колонка", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=0, padx=5, pady=2)
+        ttk.Label(inner_frame, text="Тип", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Label(inner_frame, text="Ограничения", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=2, padx=5, pady=2)
+        ttk.Label(inner_frame, text="Значение", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=3, padx=5, pady=2)
+
+        row = 1
+        for i, col in enumerate(self.data_columns):
+            col_type = self.data_types.get(col, "unknown")
+            constraints = self.column_constraints.get(col, "")
+            ttk.Label(inner_frame, text=col).grid(row=row, column=0, padx=5, pady=2, sticky="e")
+            ttk.Label(inner_frame, text=col_type).grid(row=row, column=1, padx=5, pady=2, sticky="w")
+            ttk.Label(inner_frame, text=constraints).grid(row=row, column=2, padx=5, pady=2, sticky="w")
+            var = tk.StringVar()
+            if initial_values and i < len(initial_values):
+                val = initial_values[i]
+                if val == "None":
+                    val = ""
+                var.set(val)
+            entry = ttk.Entry(inner_frame, textvariable=var, width=40)
+            entry.grid(row=row, column=3, padx=5, pady=2, sticky="ew")
+            enable_copy_paste(entry)
+            entries[col] = var
+            row += 1
+
+        inner_frame.columnconfigure(3, weight=1)
+        inner_frame.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def save():
+            new_values = []
+            for col in self.data_columns:
+                val = entries[col].get().strip()
+                if val == "":
+                    new_values.append(None)
+                else:
+                    new_values.append(val)
+            if is_edit:
+                set_parts = []
+                for col in self.data_columns:
+                    set_parts.append(sql.SQL("{} = {}").format(sql.Identifier(col), sql.Placeholder()))
+                set_clause = sql.SQL(", ").join(set_parts)
+                where_parts = []
+                where_params = []
+                for i, col in enumerate(self.data_columns):
+                    val = old_values[i]
+                    if val is None or val == "":
+                        where_parts.append(sql.SQL("{} IS NULL").format(sql.Identifier(col)))
+                    else:
+                        where_parts.append(sql.SQL("{} = {}").format(sql.Identifier(col), sql.Placeholder()))
+                        where_params.append(val)
+                where_clause = sql.SQL(" AND ").join(where_parts)
+                query = sql.SQL("UPDATE {}.{} SET {} WHERE {}").format(
+                    sql.Identifier(self.current_data_schema),
+                    sql.Identifier(self.current_data_table),
+                    set_clause,
+                    where_clause
+                )
+                try:
+                    with self.conn:
+                        self.cur.execute(query, new_values + where_params)
+                    messagebox.showinfo("Успех", "Запись обновлена.")
+                    dialog.destroy()
+                    self.load_table_data()
+                except Exception as e:
+                    self.conn.rollback()
+                    messagebox.showerror("Ошибка", f"Не удалось обновить запись:\n{e}")
+            else:
+                placeholders = sql.SQL(", ").join([sql.Placeholder()] * len(self.data_columns))
+                query = sql.SQL("INSERT INTO {}.{} ({}) VALUES ({})").format(
+                    sql.Identifier(self.current_data_schema),
+                    sql.Identifier(self.current_data_table),
+                    sql.SQL(", ").join(map(sql.Identifier, self.data_columns)),
+                    placeholders
+                )
+                try:
+                    with self.conn:
+                        self.cur.execute(query, new_values)
+                    messagebox.showinfo("Успех", "Запись добавлена.")
+                    dialog.destroy()
+                    self.load_table_data()
+                except Exception as e:
+                    self.conn.rollback()
+                    messagebox.showerror("Ошибка", f"Не удалось добавить запись:\n{e}")
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=5)
+        ttk.Button(btn_frame, text="Сохранить", command=save).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Отмена", command=dialog.destroy).pack(side="left", padx=5)
+
+    def show_copy_menu(self, event):
+        item = self.data_tree.identify_row(event.y)
+        if not item:
+            return
+        column = self.data_tree.identify_column(event.x)
+        column_index = int(column[1:]) - 1 if column else None
+        menu = tk.Menu(self.root, tearoff=0)
+        if column_index is not None and 0 <= column_index < len(self.data_columns) + 1:
+            menu.add_command(label="Копировать ячейку", command=lambda: self.copy_cell(item, column_index))
+            menu.add_command(label="Копировать строку", command=lambda: self.copy_row(item))
+        menu.post(event.x_root, event.y_root)
+
+    def copy_cell(self, item, column_index):
+        values = self.data_tree.item(item, "values")
+        if values and column_index < len(values):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(str(values[column_index]))
+
+    def copy_row(self, item):
+        values = self.data_tree.item(item, "values")
+        if values:
+            row_text = "\t".join(str(v) for v in values)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(row_text)
+
+    def copy_selected_row(self, event):
+        selected = self.data_tree.selection()
+        if selected:
+            self.copy_row(selected[0])
+
+    def load_data_schemas(self):
+        try:
+            self.cur.execute("""
+                SELECT schema_name
+                FROM information_schema.schemata
+                WHERE schema_name NOT IN ('pg_catalog', 'information_schema')
+                AND schema_name NOT LIKE 'pg_temp%'
+                AND schema_name NOT LIKE 'pg_toast%'
+                ORDER BY schema_name
+            """)
+            schemas = [row[0] for row in self.cur.fetchall()]
+            self.data_schema_combo['values'] = schemas
+            if schemas:
+                self.data_schema_combo.current(0)
+                self.load_tables_for_data_schema(schemas[0])
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить список схем:\n{e}")
+
+    def on_data_schema_selected(self, event=None):
+        schema = self.data_schema_combo.get()
+        self.load_tables_for_data_schema(schema)
+
+    def load_tables_for_data_schema(self, schema_name):
+        try:
+            self.cur.execute("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                AND table_type = 'BASE TABLE'
+                ORDER BY table_name
+            """, (schema_name,))
+            tables = [row[0] for row in self.cur.fetchall()]
+            self.data_table_combo['values'] = tables
+            if tables:
+                self.data_table_combo.current(0)
+            else:
+                self.data_table_combo.set('')
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            messagebox.showerror("Ошибка", f"Не удалось загрузить список таблиц:\n{e}")
+
+
+if __name__ == "__main__":
+    ConnectionWindow()
